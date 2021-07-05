@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare system for Kubernetes SMACK implementation
+After=network.target
+Before=kubelet.service containerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/bin/prepare-smack.sh
+
+[Install]
+RequiredBy=kubelet.service containerd.service

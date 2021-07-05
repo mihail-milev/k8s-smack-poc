@@ -1,0 +1,227 @@
+diff --git a/create.go b/create.go
+index 5f3ac609..7cbd8011 100644
+--- a/create.go
++++ b/create.go
+@@ -50,6 +50,15 @@ command(s) that get executed on start, edit the args parameter of the spec. See
+ 			Name:  "preserve-fds",
+ 			Usage: "Pass N additional file descriptors to the container (stdio + $LISTEN_FDS + N in total)",
+ 		},
++		cli.BoolFlag{
++			Name:  "use-smack",
++			Usage: "enable SMACK LSM labeling",
++		},
++		cli.StringFlag{
++			Name:  "smack-host-label",
++			Value: "",
++			Usage: "set the SMACK label for all files, which should not be reachable by containers",
++		},
+ 	},
+ 	Action: func(context *cli.Context) error {
+ 		if err := checkArgs(context, 1, exactArgs); err != nil {
+diff --git a/libcontainer/container_linux.go b/libcontainer/container_linux.go
+index 945a0fa0..69e06024 100644
+--- a/libcontainer/container_linux.go
++++ b/libcontainer/container_linux.go
+@@ -8,10 +8,12 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"io/ioutil"
+ 	"net"
+ 	"os"
+ 	"os/exec"
++	"path"
+ 	"path/filepath"
+ 	"reflect"
+ 	"strconv"
+@@ -482,7 +484,10 @@ func (c *linuxContainer) newParentProcess(p *Process) (parentProcess, error) {
+ 	}
+ 	logFilePair := filePair{parentLogPipe, childLogPipe}
+ 
+-	cmd := c.commandTemplate(p, childInitPipe, childLogPipe)
++	cmd, err := c.commandTemplate(p, childInitPipe, childLogPipe)
++	if err != nil {
++		return nil, err
++	}
+ 	if !p.Init {
+ 		return c.newSetnsProcess(p, cmd, messageSockPair, logFilePair)
+ 	}
+@@ -498,9 +503,150 @@ func (c *linuxContainer) newParentProcess(p *Process) (parentProcess, error) {
+ 	return c.newInitProcess(p, cmd, messageSockPair, logFilePair)
+ }
+ 
+-func (c *linuxContainer) commandTemplate(p *Process, childInitPipe *os.File, childLogPipe *os.File) *exec.Cmd {
+-	cmd := exec.Command(c.initPath, c.initArgs[1:]...)
+-	cmd.Args[0] = c.initArgs[0]
++func copyFile(src, dst string) error {
++	src_fh, err := os.Open(src)
++	if err != nil {
++		return err
++	}
++	defer src_fh.Close()
++
++	dst_fh, err := os.Create(dst)
++	if err != nil {
++		return err
++	}
++	defer dst_fh.Close()
++
++	_, err = io.Copy(dst_fh, src_fh)
++	if err != nil {
++		return err
++	}
++
++	err = dst_fh.Sync()
++	if err != nil {
++		return err
++	}
++
++	stat, err := os.Stat(src)
++	if err != nil {
++		return err
++	}
++
++	err = unix.Chmod(dst, uint32(stat.Mode()))
++	if err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (c *linuxContainer) createNewRuncInContainerSubfolder() (string, error) {
++	new_path := path.Join(c.config.Rootfs, "..", "runc")
++	runc_def_path, err := os.Readlink("/proc/self/exe")
++	if err != nil {
++		return "", err
++	}
++	if err := copyFile(runc_def_path, new_path); err != nil {
++		return "", err
++	}
++	if err := c.setSmackAttrsOnItem(new_path, false, unix.Setxattr); err != nil {
++		return "", err
++	}
++	return new_path, nil
++}
++
++func (c *linuxContainer) writeSmackAccessRules(host_label string) error {
++	if err := ioutil.WriteFile(SMACK_LOAD2_PATH, []byte(fmt.Sprintf("%s %s %s", "_", c.id, "rwxat")), 0644); err != nil {
++		return err
++	}
++	if err := ioutil.WriteFile(SMACK_LOAD2_PATH, []byte(fmt.Sprintf("%s %s %s", c.id, "_", "rwxat")), 0644); err != nil {
++		return err
++	}
++	if err := ioutil.WriteFile(SMACK_LOAD2_PATH, []byte(fmt.Sprintf("%s %s %s", host_label, c.id, "rwxat")), 0644); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (c *linuxContainer) setSmackAttrsOnItem(path string, is_folder bool, tbx func(string, string, []byte, int) error) error {
++	if err := tbx(path, SMACK_XATTR_SMACK64, []byte(c.id), 0); err != nil {
++		return err
++	}
++	if err := tbx(path, SMACK_XATTR_SMACK64EXEC, []byte(c.id), 0); err != nil {
++		return err
++	}
++	if err := tbx(path, SMACK_XATTR_SMACK64MMAP, []byte(c.id), 0); err != nil {
++		return err
++	}
++	if is_folder {
++		if err := tbx(path, SMACK_XATTR_SMACK64TRANSMUTE, []byte("TRUE"), 0); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (c *linuxContainer) setSmackLabelsRecursively(curPath string) error {
++	itms, err := ioutil.ReadDir(curPath)
++	if err != nil {
++		return err
++	}
++	for _, subitem := range itms {
++		item_abs_path := path.Join(curPath, subitem.Name())
++		if subitem.IsDir() {
++			if err := c.setSmackAttrsOnItem(item_abs_path, true, unix.Setxattr); err != nil {
++				return err
++			}
++			if err := c.setSmackLabelsRecursively(item_abs_path); err != nil {
++				return err
++			}
++		} else if subitem.Mode()&fs.ModeSymlink == 0 {
++			if err := c.setSmackAttrsOnItem(item_abs_path, false, unix.Setxattr); err != nil {
++				return err
++			}
++		} else {
++			if err := c.setSmackAttrsOnItem(item_abs_path, false, unix.Lsetxattr); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (c *linuxContainer) smackShallBeUsed() (bool, string, error) {
++	smack_label := os.Getenv(SMACK_USE_ENV_VAR)
++	if smack_label != "" {
++		os.Unsetenv(SMACK_USE_ENV_VAR)
++		_, err := os.Stat(SMACK_LOAD2_PATH)
++		if err != nil {
++			return false, "", err
++		}
++		return true, smack_label, nil
++	}
++	return false, "", nil
++}
++
++func (c *linuxContainer) commandTemplate(p *Process, childInitPipe *os.File, childLogPipe *os.File) (*exec.Cmd, error) {
++	var cmd *exec.Cmd
++	smack_to_be_used, smack_host_label, err := c.smackShallBeUsed()
++	if err != nil {
++		return nil, newSystemErrorWithCause(err, "asked for SMACK, but SMACK not available")
++	}
++	if smack_to_be_used && len(c.initArgs) > 1 && c.initArgs[1] == "init" {
++		new_path, err := c.createNewRuncInContainerSubfolder()
++		if err != nil {
++			return nil, newSystemErrorWithCause(err, "copy runc for SMACK")
++		}
++		if err := c.writeSmackAccessRules(smack_host_label); err != nil {
++			return nil, newSystemErrorWithCause(err, "prepare new runc for SMACK")
++		}
++		if err := c.setSmackLabelsRecursively(path.Join(c.config.Rootfs, "")); err != nil {
++			return nil, newSystemErrorWithCause(err, "set SMACK labels recursively")
++		}
++		cmd = exec.Command(new_path, c.initArgs[1:]...)
++	} else {
++		cmd = exec.Command(c.initPath, c.initArgs[1:]...)
++		cmd.Args[0] = c.initArgs[0]
++	}
+ 	cmd.Stdin = p.Stdin
+ 	cmd.Stdout = p.Stdout
+ 	cmd.Stderr = p.Stderr
+@@ -534,7 +680,7 @@ func (c *linuxContainer) commandTemplate(p *Process, childInitPipe *os.File, chi
+ 	if c.config.ParentDeathSignal > 0 {
+ 		cmd.SysProcAttr.Pdeathsig = unix.Signal(c.config.ParentDeathSignal)
+ 	}
+-	return cmd
++	return cmd, nil
+ }
+ 
+ func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, messageSockPair, logFilePair filePair) (*initProcess, error) {
+diff --git a/utils_linux.go b/utils_linux.go
+index 8241d423..dd8c0e87 100644
+--- a/utils_linux.go
++++ b/utils_linux.go
+@@ -454,5 +454,10 @@ func startContainer(context *cli.Context, spec *specs.Spec, action CtAct, criuOp
+ 		init:            true,
+ 		logLevel:        logLevel,
+ 	}
++
++	if context.Bool("use-smack") {
++		os.Setenv(libcontainer.SMACK_USE_ENV_VAR, context.String("smack-host-label"))
++	}
++
+ 	return r.run(spec.Process)
+ }

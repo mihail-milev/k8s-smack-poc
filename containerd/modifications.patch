@@ -1,0 +1,64 @@
+diff --git a/runtime/v2/manager.go b/runtime/v2/manager.go
+index f8cdd9c6c..1ccf9dca2 100644
+--- a/runtime/v2/manager.go
++++ b/runtime/v2/manager.go
+@@ -41,7 +41,8 @@ import (
+ // Config for the v2 runtime
+ type Config struct {
+ 	// Supported platforms
+-	Platforms []string `toml:"platforms"`
++	Platforms      []string `toml:"platforms"`
++	SmackHostLabel string   `toml:"smack_host_label"`
+ }
+ 
+ func init() {
+diff --git a/vendor/github.com/containerd/go-runc/runc.go b/vendor/github.com/containerd/go-runc/runc.go
+index f5f03ae95..29878102b 100644
+--- a/vendor/github.com/containerd/go-runc/runc.go
++++ b/vendor/github.com/containerd/go-runc/runc.go
+@@ -32,6 +32,7 @@ import (
+ 	"time"
+ 
+ 	specs "github.com/opencontainers/runtime-spec/specs-go"
++	toml "github.com/pelletier/go-toml"
+ )
+ 
+ // Format is the type of log formatting options avaliable
+@@ -98,6 +99,25 @@ type CreateOpts struct {
+ 	Started       chan<- int
+ }
+ 
++func smackConfig() string {
++	dt, err := ioutil.ReadFile("/etc/containerd/config.toml")
++	if err != nil {
++		return ""
++	}
++	var containerd_config struct {
++		Plugins map[string]struct {
++			SmackLabel string `toml:"smack_host_label"`
++		} `toml:"plugins"`
++	}
++	if err := toml.Unmarshal(dt, &containerd_config); err != nil {
++		return ""
++	}
++	if subitem, ok := containerd_config.Plugins["io.containerd.runtime.v2.task"]; ok {
++		return subitem.SmackLabel
++	}
++	return ""
++}
++
+ func (o *CreateOpts) args() (out []string, err error) {
+ 	if o.PidFile != "" {
+ 		abs, err := filepath.Abs(o.PidFile)
+@@ -121,6 +141,11 @@ func (o *CreateOpts) args() (out []string, err error) {
+ 	if o.ExtraFiles != nil {
+ 		out = append(out, "--preserve-fds", strconv.Itoa(len(o.ExtraFiles)))
+ 	}
++	smack_lbl := smackConfig()
++	if smack_lbl != "" {
++		out = append(out, "--use-smack")
++		out = append(out, "--smack-host-label", smack_lbl)
++	}
+ 	return out, nil
+ }
+ 
